@@ -23,8 +23,9 @@ import ta
 #  CONFIGURATION — à modifier
 # ─────────────────────────────────────────────
 
-API_KEY    = "VOTRE_CLE_API_BINANCE"
-API_SECRET = "VOTRE_SECRET_API_BINANCE"
+import os
+API_KEY    = os.environ.get("BINANCE_API_KEY", "P2AVDIRA5yWCUDzpalHoCmYIG93QAmaBtaQnmvQcfYEmHO2LLc7dp5dvXsLxon3H")
+API_SECRET = os.environ.get("BINANCE_API_SECRET", "caWW0oCZ025aah1EigG0LDOcLdAS08w2jDfajJoJmW5igCgo1k1lx3zAAg4IVKWA")
 
 SYMBOL          = "BTCUSDT"       # Paire tradée
 INTERVAL        = Client.KLINE_INTERVAL_1HOUR  # Timeframe : 1h
