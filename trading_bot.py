@@ -36,7 +36,7 @@ TAKE_PROFIT_PCT = 0.06            # Take-profit : +6 %
 MAX_DRAWDOWN    = 0.10            # Arrêt du bot si -10 % du capital initial
 
 PAPER_TRADING   = True            # True = simulation | False = ordres réels
-LOOP_INTERVAL   = 60 * 1          # Vérification toutes les 1min (en secondes)
+LOOP_INTERVAL   = 60 * 60          # Vérification toutes les heures (en secondes)
 
 # ─────────────────────────────────────────────
 #  LOGGING
