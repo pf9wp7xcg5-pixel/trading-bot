@@ -19,6 +19,12 @@ from binance.exceptions import BinanceAPIException
 import pandas as pd
 import ta
 
+# ip de railway ? 
+import requests
+ip = requests.get("https://api.ipify.org").text
+print(f"IP Railway : {ip}")
+
+
 # ─────────────────────────────────────────────
 #  CONFIGURATION — à modifier
 # ─────────────────────────────────────────────
