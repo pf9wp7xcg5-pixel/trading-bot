@@ -35,7 +35,7 @@ API_SECRET = os.environ.get("BINANCE_API_SECRET", "7wFL6yjSF0dqPKfuhHIsF3gJoVhRP
 
 SYMBOL          = "BTCUSDT"       # Paire tradée
 INTERVAL        = Client.KLINE_INTERVAL_1HOUR  # Timeframe : 1h
-CAPITAL_USDT    = 100.0           # Capital alloué en USDT
+CAPITAL_USDT    = 20.0           # Capital alloué en USDT
 RISK_PER_TRADE  = 0.02            # Risque max par trade : 2 % du capital
 STOP_LOSS_PCT   = 0.03            # Stop-loss : -3 %
 TAKE_PROFIT_PCT = 0.06            # Take-profit : +6 %
