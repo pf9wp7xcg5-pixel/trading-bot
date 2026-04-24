@@ -30,8 +30,8 @@ print(f"IP Railway : {ip}")
 # ─────────────────────────────────────────────
 
 import os
-API_KEY    = os.environ.get("BINANCE_API_KEY", "P2AVDIRA5yWCUDzpalHoCmYIG93QAmaBtaQnmvQcfYEmHO2LLc7dp5dvXsLxon3H")
-API_SECRET = os.environ.get("BINANCE_API_SECRET", "caWW0oCZ025aah1EigG0LDOcLdAS08w2jDfajJoJmW5igCgo1k1lx3zAAg4IVKWA")
+API_KEY    = os.environ.get("BINANCE_API_KEY", "vwLx2jvN8nhDJlD4MpPRxHeaM9yRC2QQRy1sSkoz6TqOHEBG9ao2bw4jN3j6oIzH")
+API_SECRET = os.environ.get("BINANCE_API_SECRET", "7wFL6yjSF0dqPKfuhHIsF3gJoVhRPvNHYXNDbSafTEHMAdDADluFVKgZvxS5XjRO")
 
 SYMBOL          = "BTCUSDT"       # Paire tradée
 INTERVAL        = Client.KLINE_INTERVAL_1HOUR  # Timeframe : 1h
