@@ -33,15 +33,15 @@ import os
 API_KEY    = os.environ.get("BINANCE_API_KEY", "vwLx2jvN8nhDJlD4MpPRxHeaM9yRC2QQRy1sSkoz6TqOHEBG9ao2bw4jN3j6oIzH")
 API_SECRET = os.environ.get("BINANCE_API_SECRET", "7wFL6yjSF0dqPKfuhHIsF3gJoVhRPvNHYXNDbSafTEHMAdDADluFVKgZvxS5XjRO")
 
-SYMBOL          = "BTCUSDT"       # Paire tradée
+SYMBOL          = "BTCUSDC"       # Paire tradée
 INTERVAL        = Client.KLINE_INTERVAL_1HOUR  # Timeframe : 1h
-CAPITAL_USDT    = 20.0           # Capital alloué en USDT
+CAPITAL_USDT    = 32.0            # Capital alloué en USDT
 RISK_PER_TRADE  = 0.02            # Risque max par trade : 2 % du capital
 STOP_LOSS_PCT   = 0.03            # Stop-loss : -3 %
 TAKE_PROFIT_PCT = 0.06            # Take-profit : +6 %
 MAX_DRAWDOWN    = 0.10            # Arrêt du bot si -10 % du capital initial
 
-PAPER_TRADING   = True            # True = simulation | False = ordres réels
+PAPER_TRADING   = False            # True = simulation | False = ordres réels
 LOOP_INTERVAL   = 60 * 60          # Vérification toutes les heures (en secondes)
 
 # ─────────────────────────────────────────────
@@ -127,11 +127,11 @@ def signal(df: pd.DataFrame) -> str:
     bullish_trend = last["ma50"] > last["ma200"]
     bearish_trend = last["ma50"] < last["ma200"]
 
-    rsi_oversold  = last["rsi"] < 35
+    rsi_oversold  = last["rsi"] < 40
     rsi_overbought = last["rsi"] > 65
 
     # On vérifie aussi un croisement RSI (plutôt qu'un niveau statique)
-    rsi_crosses_up   = prev["rsi"] < 35 and last["rsi"] >= 35
+    rsi_crosses_up   = prev["rsi"] < 40 and last["rsi"] >= 40
     rsi_crosses_down = prev["rsi"] > 65 and last["rsi"] <= 65
 
     if (rsi_oversold or rsi_crosses_up) and bullish_trend:
