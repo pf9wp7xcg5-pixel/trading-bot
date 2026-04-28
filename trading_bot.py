@@ -10,7 +10,6 @@ Installation :
 import time
 import logging
 import os
-from datetime import datetime
 import ccxt
 import pandas as pd
 import ta
@@ -24,7 +23,6 @@ API_SECRET = os.environ.get("KRAKEN_API_SECRET", "")
 
 SYMBOL          = "BTC/USDC"
 TIMEFRAME       = "1h"
-CAPITAL_USDC    = 32.0
 RISK_PER_TRADE  = 0.02
 STOP_LOSS_PCT   = 0.03
 TAKE_PROFIT_PCT = 0.06
@@ -57,17 +55,16 @@ state = {
     "position"       : None,
     "entry_price"    : 0.0,
     "quantity"       : 0.0,
-    "capital"        : CAPITAL_USDC,
-    "capital_initial": CAPITAL_USDC,
-    "trade_count"    : 0,
+    "capital_initial": None,  # sera défini au premier lancement
     "pnl_total"      : 0.0,
+    "trade_count"    : 0,
 }
 
 # ─────────────────────────────────────────────
 #  CONNEXION KRAKEN
 # ─────────────────────────────────────────────
 
-def connect() -> ccxt.kraken:
+def connect():
     exchange = ccxt.kraken({
         "apiKey": API_KEY,
         "secret": API_SECRET,
@@ -76,6 +73,32 @@ def connect() -> ccxt.kraken:
     })
     log.info("Connexion Kraken établie.")
     return exchange
+
+# ─────────────────────────────────────────────
+#  SOLDE RÉEL
+# ─────────────────────────────────────────────
+
+def get_usdc_balance(exchange) -> float:
+    """Récupère le solde USDC réel disponible sur Kraken."""
+    if PAPER_TRADING:
+        return state.get("paper_capital", state["capital_initial"] or 30.0)
+    try:
+        balance = exchange.fetch_balance()
+        return float(balance["free"].get("USDC", 0.0))
+    except Exception as e:
+        log.error(f"Erreur récupération solde : {e}")
+        return 0.0
+
+def get_btc_balance(exchange) -> float:
+    """Récupère le solde BTC réel disponible sur Kraken."""
+    if PAPER_TRADING:
+        return state.get("paper_btc", 0.0)
+    try:
+        balance = exchange.fetch_balance()
+        return float(balance["free"].get("BTC", 0.0) or balance["free"].get("XBT", 0.0))
+    except Exception as e:
+        log.error(f"Erreur récupération solde BTC : {e}")
+        return 0.0
 
 # ─────────────────────────────────────────────
 #  DONNÉES DE MARCHÉ
@@ -129,16 +152,20 @@ def signal(df: pd.DataFrame) -> str:
 # ─────────────────────────────────────────────
 
 def position_size(capital: float, price: float) -> float:
+    """Calcule la quantité à acheter selon le capital réel disponible."""
     risk_amount   = capital * RISK_PER_TRADE
     stop_distance = price * STOP_LOSS_PCT
     qty = risk_amount / stop_distance
     return round(qty, 6)
 
-def check_drawdown(price: float = 0.0) -> bool:
-    """Calcule le drawdown sur la valeur totale du portefeuille."""
-    btc_value = state["quantity"] * price if state["position"] == "long" else 0.0
-    total_value = state["capital"] + btc_value
-    loss_pct = (state["capital_initial"] - total_value) / state["capital_initial"]
+def check_drawdown(exchange, price: float) -> bool:
+    """Calcule le drawdown sur la valeur totale réelle du portefeuille."""
+    if state["capital_initial"] is None:
+        return False
+    usdc  = get_usdc_balance(exchange)
+    btc   = get_btc_balance(exchange)
+    total = usdc + btc * price
+    loss_pct = (state["capital_initial"] - total) / state["capital_initial"]
     if loss_pct >= MAX_DRAWDOWN:
         log.warning(f"Drawdown maximum atteint ({loss_pct:.1%}). Arrêt du bot.")
         return True
@@ -149,15 +176,23 @@ def check_drawdown(price: float = 0.0) -> bool:
 # ─────────────────────────────────────────────
 
 def buy(exchange, price: float) -> None:
-    qty  = position_size(state["capital"], price)
+    capital = get_usdc_balance(exchange)
+    if capital < 1.0:
+        log.warning(f"Capital insuffisant : {capital:.2f} USDC")
+        return
+
+    qty  = position_size(capital, price)
     cost = qty * price
 
-    if cost > state["capital"]:
-        log.warning("Capital insuffisant.")
-        return
+    # Sécurité : ne pas dépenser plus que le capital disponible
+    if cost > capital:
+        qty  = round((capital * 0.95) / price, 6)
+        cost = qty * price
 
     if PAPER_TRADING:
         log.info(f"[PAPER] ACHAT  {qty} BTC @ {price:.2f} USDC  (coût : {cost:.2f} USDC)")
+        state["paper_capital"] = capital - cost
+        state["paper_btc"]     = state.get("paper_btc", 0.0) + qty
     else:
         try:
             exchange.create_market_buy_order(SYMBOL, qty)
@@ -169,7 +204,6 @@ def buy(exchange, price: float) -> None:
     state["position"]    = "long"
     state["entry_price"] = price
     state["quantity"]    = qty
-    state["capital"]    -= cost
     state["trade_count"] += 1
 
 def sell(exchange, price: float, reason: str = "signal") -> None:
@@ -182,17 +216,18 @@ def sell(exchange, price: float, reason: str = "signal") -> None:
 
     if PAPER_TRADING:
         log.info(f"[PAPER] VENTE  {qty} BTC @ {price:.2f} USDC  PnL : {gain:+.2f} USDC ({pnl_pct:+.2%})  raison : {reason}")
+        state["paper_capital"] = state.get("paper_capital", 0.0) + qty * price
+        state["paper_btc"]     = max(0.0, state.get("paper_btc", 0.0) - qty)
     else:
         try:
             exchange.create_market_sell_order(SYMBOL, qty)
-            log.info(f"[RÉEL]  VENTE  {qty} BTC @ ~{price:.2f} USDC  PnL : {gain:+.2f} USDC")
+            log.info(f"[RÉEL]  VENTE  {qty} BTC @ ~{price:.2f} USDC  PnL : {gain:+.2f} USDC ({pnl_pct:+.2%})")
         except Exception as e:
             log.error(f"Erreur ordre vente : {e}")
             return
 
-    state["capital"]    += qty * price
-    state["pnl_total"]  += gain
-    state["position"]    = None
+    state["pnl_total"] += gain
+    state["position"]   = None
     state["entry_price"] = 0.0
     state["quantity"]    = 0.0
 
@@ -224,14 +259,28 @@ def run() -> None:
 
     exchange = connect()
 
+    # Initialise le capital initial depuis le solde réel
+    usdc = get_usdc_balance(exchange)
+    btc  = get_btc_balance(exchange)
+
     while True:
         try:
-            if check_drawdown():
-                break
-
             df    = get_ohlcv(exchange)
             df    = compute_indicators(df)
             price = get_price(exchange)
+
+            # Initialise le capital initial au premier cycle
+            if state["capital_initial"] is None:
+                state["capital_initial"] = usdc + btc * price
+                if PAPER_TRADING:
+                    state["paper_capital"] = usdc
+                    state["paper_btc"]     = btc
+                log.info(f"Capital initial : {state['capital_initial']:.2f} USDC")
+
+            # Solde actuel
+            usdc = get_usdc_balance(exchange)
+            btc  = get_btc_balance(exchange)
+            total = usdc + btc * price
 
             rsi   = df.iloc[-1]["rsi"]
             ma50  = df.iloc[-1]["ma50"]
@@ -240,9 +289,12 @@ def run() -> None:
             log.info(
                 f"Prix : {price:.2f} | RSI : {rsi:.1f} | "
                 f"MA50 : {ma50:.2f} | MA200 : {ma200:.2f} | "
-                f"Capital : {state['capital']:.2f} USDC | "
-                f"PnL total : {state['pnl_total']:+.2f} USDC"
+                f"USDC : {usdc:.2f} | BTC : {btc:.6f} | "
+                f"Total : {total:.2f} USDC | PnL : {state['pnl_total']:+.2f} USDC"
             )
+
+            if check_drawdown(exchange, price):
+                break
 
             check_exit(exchange, price)
 
