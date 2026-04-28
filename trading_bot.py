@@ -134,8 +134,11 @@ def position_size(capital: float, price: float) -> float:
     qty = risk_amount / stop_distance
     return round(qty, 6)
 
-def check_drawdown() -> bool:
-    loss_pct = (state["capital_initial"] - state["capital"]) / state["capital_initial"]
+def check_drawdown(price: float = 0.0) -> bool:
+    """Calcule le drawdown sur la valeur totale du portefeuille."""
+    btc_value = state["quantity"] * price if state["position"] == "long" else 0.0
+    total_value = state["capital"] + btc_value
+    loss_pct = (state["capital_initial"] - total_value) / state["capital_initial"]
     if loss_pct >= MAX_DRAWDOWN:
         log.warning(f"Drawdown maximum atteint ({loss_pct:.1%}). Arrêt du bot.")
         return True
