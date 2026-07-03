@@ -1,7 +1,7 @@
 """
 Bot de trading algorithmique — Stratégie RSI + Moyennes Mobiles
 Exchange : Kraken (via ccxt)
-Mode : Paper Trading activé par défaut (aucun ordre réel)
+Paires : BTC/USDC + ETH/USDC (multi-paires avec capital séparé)
 
 Installation :
     pip install ccxt pandas ta
@@ -15,23 +15,41 @@ import pandas as pd
 import ta
 
 # ─────────────────────────────────────────────
-#  CONFIGURATION
+#  CONFIGURATION GLOBALE
 # ─────────────────────────────────────────────
 
 API_KEY    = os.environ.get("KRAKEN_API_KEY", "")
 API_SECRET = os.environ.get("KRAKEN_API_SECRET", "")
 
-SYMBOL          = "BTC/USDC"
-TIMEFRAME       = "1h"
-RISK_PER_TRADE  = 0.02
-STOP_LOSS_PCT   = 0.03
-TAKE_PROFIT_PCT = 0.06
-MAX_DRAWDOWN    = 0.10
-RSI_BUY         = 40
-RSI_SELL        = 65
+PAPER_TRADING = os.environ.get("PAPER_TRADING", "true").lower() == "true"
+LOOP_INTERVAL = 60 * 60  # toutes les heures
 
-PAPER_TRADING   = os.environ.get("PAPER_TRADING", "true").lower() == "true"
-LOOP_INTERVAL   = 60 * 60
+# ─────────────────────────────────────────────
+#  CONFIGURATION PAR PAIRE
+# ─────────────────────────────────────────────
+
+PAIRS_CONFIG = {
+    "BTC/USDC": {
+        "capital":        226.0,   # 70% de 322 USDC
+        "risk_per_trade": 0.02,
+        "stop_loss_pct":  0.03,
+        "take_profit_pct":0.06,
+        "max_drawdown":   0.10,
+        "rsi_buy":        40,
+        "rsi_sell":       65,
+        "timeframe":      "1h",
+    },
+    "ETH/USDC": {
+        "capital":        96.0,    # 30% de 322 USDC
+        "risk_per_trade": 0.02,
+        "stop_loss_pct":  0.04,    # ETH plus volatile → stop plus large
+        "take_profit_pct":0.08,    # ETH plus volatile → TP plus ambitieux
+        "max_drawdown":   0.10,
+        "rsi_buy":        40,
+        "rsi_sell":       65,
+        "timeframe":      "1h",
+    },
+}
 
 # ─────────────────────────────────────────────
 #  LOGGING
@@ -48,20 +66,22 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 # ─────────────────────────────────────────────
-#  ÉTAT INTERNE
+#  ÉTAT PAR PAIRE
 # ─────────────────────────────────────────────
 
-state = {
-    "position"       : None,
-    "entry_price"    : 0.0,
-    "quantity"       : 0.0,
-    "capital_initial": None,  # sera défini au premier lancement
-    "pnl_total"      : 0.0,
-    "trade_count"    : 0,
-}
+def init_state(config: dict) -> dict:
+    return {
+        "position":        None,
+        "entry_price":     0.0,
+        "quantity":        0.0,
+        "capital":         config["capital"],
+        "capital_initial": config["capital"],
+        "pnl_total":       0.0,
+        "trade_count":     0,
+    }
 
 # ─────────────────────────────────────────────
-#  CONNEXION KRAKEN
+#  CONNEXION
 # ─────────────────────────────────────────────
 
 def connect():
@@ -75,46 +95,17 @@ def connect():
     return exchange
 
 # ─────────────────────────────────────────────
-#  SOLDE RÉEL
-# ─────────────────────────────────────────────
-
-def get_usdc_balance(exchange) -> float:
-    """Récupère le solde USDC réel disponible sur Kraken."""
-    if PAPER_TRADING:
-        return state.get("paper_capital", state["capital_initial"] or 30.0)
-    try:
-        balance = exchange.fetch_balance()
-        return float(balance["free"].get("USDC", 0.0))
-    except Exception as e:
-        log.error(f"Erreur récupération solde : {e}")
-        return 0.0
-
-def get_btc_balance(exchange) -> float:
-    """Récupère le solde BTC réel disponible sur Kraken."""
-    if PAPER_TRADING:
-        return state.get("paper_btc", 0.0)
-    try:
-        balance = exchange.fetch_balance()
-        return float(balance["free"].get("BTC", 0.0) or balance["free"].get("XBT", 0.0))
-    except Exception as e:
-        log.error(f"Erreur récupération solde BTC : {e}")
-        return 0.0
-
-# ─────────────────────────────────────────────
 #  DONNÉES DE MARCHÉ
 # ─────────────────────────────────────────────
 
-def get_ohlcv(exchange, limit: int = 250) -> pd.DataFrame:
-    ohlcv = exchange.fetch_ohlcv(SYMBOL, timeframe=TIMEFRAME, limit=limit)
+def get_ohlcv(exchange, symbol: str, timeframe: str, limit: int = 250) -> pd.DataFrame:
+    ohlcv = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
     df = pd.DataFrame(ohlcv, columns=["timestamp", "open", "high", "low", "close", "volume"])
     df["close"] = df["close"].astype(float)
-    df["high"]  = df["high"].astype(float)
-    df["low"]   = df["low"].astype(float)
     return df
 
-def get_price(exchange) -> float:
-    ticker = exchange.fetch_ticker(SYMBOL)
-    return float(ticker["last"])
+def get_price(exchange, symbol: str) -> float:
+    return float(exchange.fetch_ticker(symbol)["last"])
 
 # ─────────────────────────────────────────────
 #  INDICATEURS
@@ -127,23 +118,24 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 # ─────────────────────────────────────────────
-#  SIGNAUX
+#  SIGNAL
 # ─────────────────────────────────────────────
 
-def signal(df: pd.DataFrame) -> str:
+def signal(df: pd.DataFrame, cfg: dict) -> str:
     last = df.iloc[-1]
     prev = df.iloc[-2]
 
-    bullish_trend    = last["ma50"] > last["ma200"]
-    bearish_trend    = last["ma50"] < last["ma200"]
-    rsi_oversold     = last["rsi"] < RSI_BUY
-    rsi_overbought   = last["rsi"] > RSI_SELL
-    rsi_crosses_up   = prev["rsi"] < RSI_BUY  and last["rsi"] >= RSI_BUY
-    rsi_crosses_down = prev["rsi"] > RSI_SELL and last["rsi"] <= RSI_SELL
+    bullish = last["ma50"] > last["ma200"]
+    bearish = last["ma50"] < last["ma200"]
 
-    if (rsi_oversold or rsi_crosses_up) and bullish_trend:
+    rsi_oversold     = last["rsi"] < cfg["rsi_buy"]
+    rsi_overbought   = last["rsi"] > cfg["rsi_sell"]
+    rsi_crosses_up   = prev["rsi"] < cfg["rsi_buy"]  and last["rsi"] >= cfg["rsi_buy"]
+    rsi_crosses_down = prev["rsi"] > cfg["rsi_sell"] and last["rsi"] <= cfg["rsi_sell"]
+
+    if (rsi_oversold or rsi_crosses_up) and bullish:
         return "BUY"
-    if (rsi_overbought or rsi_crosses_down) and bearish_trend:
+    if (rsi_overbought or rsi_crosses_down) and bearish:
         return "SELL"
     return "HOLD"
 
@@ -151,23 +143,15 @@ def signal(df: pd.DataFrame) -> str:
 #  GESTION DU RISQUE
 # ─────────────────────────────────────────────
 
-def position_size(capital: float, price: float) -> float:
-    """Calcule la quantité à acheter selon le capital réel disponible."""
-    risk_amount   = capital * RISK_PER_TRADE
-    stop_distance = price * STOP_LOSS_PCT
-    qty = risk_amount / stop_distance
-    return round(qty, 6)
+def position_size(capital: float, price: float, cfg: dict) -> float:
+    risk    = capital * cfg["risk_per_trade"]
+    stop_d  = price * cfg["stop_loss_pct"]
+    return round(risk / stop_d, 6)
 
-def check_drawdown(exchange, price: float) -> bool:
-    """Calcule le drawdown sur la valeur totale réelle du portefeuille."""
-    if state["capital_initial"] is None:
-        return False
-    usdc  = get_usdc_balance(exchange)
-    btc   = get_btc_balance(exchange)
-    total = usdc + btc * price
-    loss_pct = (state["capital_initial"] - total) / state["capital_initial"]
-    if loss_pct >= MAX_DRAWDOWN:
-        log.warning(f"Drawdown maximum atteint ({loss_pct:.1%}). Arrêt du bot.")
+def check_drawdown(state: dict, cfg: dict) -> bool:
+    loss = (state["capital_initial"] - state["capital"]) / state["capital_initial"]
+    if loss >= cfg["max_drawdown"]:
+        log.warning(f"Drawdown max atteint ({loss:.1%}). Paire suspendue.")
         return True
     return False
 
@@ -175,38 +159,35 @@ def check_drawdown(exchange, price: float) -> bool:
 #  ORDRES
 # ─────────────────────────────────────────────
 
-def buy(exchange, price: float) -> None:
-    capital = get_usdc_balance(exchange)
+def buy(exchange, symbol: str, price: float, state: dict, cfg: dict) -> None:
+    capital = state["capital"]
     if capital < 1.0:
-        log.warning(f"Capital insuffisant : {capital:.2f} USDC")
+        log.warning(f"[{symbol}] Capital insuffisant : {capital:.2f} USDC")
         return
 
-    qty  = position_size(capital, price)
+    qty  = position_size(capital, price, cfg)
     cost = qty * price
-
-    # Sécurité : ne pas dépenser plus que le capital disponible
     if cost > capital:
         qty  = round((capital * 0.95) / price, 6)
         cost = qty * price
 
     if PAPER_TRADING:
-        log.info(f"[PAPER] ACHAT  {qty} BTC @ {price:.2f} USDC  (coût : {cost:.2f} USDC)")
-        state["paper_capital"] = capital - cost
-        state["paper_btc"]     = state.get("paper_btc", 0.0) + qty
+        log.info(f"[PAPER][{symbol}] ACHAT {qty} @ {price:.2f} (coût : {cost:.2f} USDC)")
     else:
         try:
-            exchange.create_market_buy_order(SYMBOL, qty)
-            log.info(f"[RÉEL]  ACHAT  {qty} BTC @ ~{price:.2f} USDC")
+            exchange.create_market_buy_order(symbol, qty)
+            log.info(f"[RÉEL] [{symbol}] ACHAT {qty} @ ~{price:.2f} USDC")
         except Exception as e:
-            log.error(f"Erreur ordre achat : {e}")
+            log.error(f"[{symbol}] Erreur achat : {e}")
             return
 
     state["position"]    = "long"
     state["entry_price"] = price
     state["quantity"]    = qty
+    state["capital"]    -= cost
     state["trade_count"] += 1
 
-def sell(exchange, price: float, reason: str = "signal") -> None:
+def sell(exchange, symbol: str, price: float, state: dict, reason: str = "signal") -> None:
     if state["position"] != "long":
         return
 
@@ -215,19 +196,18 @@ def sell(exchange, price: float, reason: str = "signal") -> None:
     pnl_pct = (price - state["entry_price"]) / state["entry_price"]
 
     if PAPER_TRADING:
-        log.info(f"[PAPER] VENTE  {qty} BTC @ {price:.2f} USDC  PnL : {gain:+.2f} USDC ({pnl_pct:+.2%})  raison : {reason}")
-        state["paper_capital"] = state.get("paper_capital", 0.0) + qty * price
-        state["paper_btc"]     = max(0.0, state.get("paper_btc", 0.0) - qty)
+        log.info(f"[PAPER][{symbol}] VENTE {qty} @ {price:.2f}  PnL : {gain:+.2f} USDC ({pnl_pct:+.2%})  raison : {reason}")
     else:
         try:
-            exchange.create_market_sell_order(SYMBOL, qty)
-            log.info(f"[RÉEL]  VENTE  {qty} BTC @ ~{price:.2f} USDC  PnL : {gain:+.2f} USDC ({pnl_pct:+.2%})")
+            exchange.create_market_sell_order(symbol, qty)
+            log.info(f"[RÉEL] [{symbol}] VENTE {qty} @ ~{price:.2f}  PnL : {gain:+.2f} USDC ({pnl_pct:+.2%})")
         except Exception as e:
-            log.error(f"Erreur ordre vente : {e}")
+            log.error(f"[{symbol}] Erreur vente : {e}")
             return
 
-    state["pnl_total"] += gain
-    state["position"]   = None
+    state["capital"]    += qty * price
+    state["pnl_total"]  += gain
+    state["position"]    = None
     state["entry_price"] = 0.0
     state["quantity"]    = 0.0
 
@@ -235,19 +215,19 @@ def sell(exchange, price: float, reason: str = "signal") -> None:
 #  STOP-LOSS / TAKE-PROFIT
 # ─────────────────────────────────────────────
 
-def check_exit(exchange, price: float) -> None:
+def check_exit(exchange, symbol: str, price: float, state: dict, cfg: dict) -> None:
     if state["position"] != "long":
         return
 
-    sl = state["entry_price"] * (1 - STOP_LOSS_PCT)
-    tp = state["entry_price"] * (1 + TAKE_PROFIT_PCT)
+    sl = state["entry_price"] * (1 - cfg["stop_loss_pct"])
+    tp = state["entry_price"] * (1 + cfg["take_profit_pct"])
 
     if price <= sl:
-        log.warning(f"Stop-loss déclenché à {price:.2f} (seuil : {sl:.2f})")
-        sell(exchange, price, reason="stop-loss")
+        log.warning(f"[{symbol}] Stop-loss déclenché à {price:.2f} (seuil : {sl:.2f})")
+        sell(exchange, symbol, price, state, reason="stop-loss")
     elif price >= tp:
-        log.info(f"Take-profit déclenché à {price:.2f} (seuil : {tp:.2f})")
-        sell(exchange, price, reason="take-profit")
+        log.info(f"[{symbol}] Take-profit déclenché à {price:.2f} (seuil : {tp:.2f})")
+        sell(exchange, symbol, price, state, reason="take-profit")
 
 # ─────────────────────────────────────────────
 #  BOUCLE PRINCIPALE
@@ -255,59 +235,51 @@ def check_exit(exchange, price: float) -> None:
 
 def run() -> None:
     mode = "PAPER TRADING" if PAPER_TRADING else "TRADING RÉEL ⚠️"
-    log.info(f"═══ Démarrage du bot [{mode}] — {SYMBOL} ═══")
+    log.info(f"═══ Démarrage du bot multi-paires [{mode}] ═══")
+    for sym, cfg in PAIRS_CONFIG.items():
+        log.info(f"  {sym} → capital : {cfg['capital']:.2f} USDC | SL : {cfg['stop_loss_pct']*100:.0f}% | TP : {cfg['take_profit_pct']*100:.0f}%")
 
     exchange = connect()
 
-    # Initialise le capital initial depuis le solde réel
-    usdc = get_usdc_balance(exchange)
-    btc  = get_btc_balance(exchange)
+    # Initialiser l'état de chaque paire
+    states = {sym: init_state(cfg) for sym, cfg in PAIRS_CONFIG.items()}
 
     while True:
-        try:
-            df    = get_ohlcv(exchange)
-            df    = compute_indicators(df)
-            price = get_price(exchange)
+        for symbol, cfg in PAIRS_CONFIG.items():
+            state = states[symbol]
+            try:
+                if check_drawdown(state, cfg):
+                    continue
 
-            # Initialise le capital initial au premier cycle
-            if state["capital_initial"] is None:
-                state["capital_initial"] = usdc + btc * price
-                if PAPER_TRADING:
-                    state["paper_capital"] = usdc
-                    state["paper_btc"]     = btc
-                log.info(f"Capital initial : {state['capital_initial']:.2f} USDC")
+                df    = get_ohlcv(exchange, symbol, cfg["timeframe"])
+                df    = compute_indicators(df)
+                price = get_price(exchange, symbol)
 
-            # Solde actuel
-            usdc = get_usdc_balance(exchange)
-            btc  = get_btc_balance(exchange)
-            total = usdc + btc * price
+                rsi   = df.iloc[-1]["rsi"]
+                ma50  = df.iloc[-1]["ma50"]
+                ma200 = df.iloc[-1]["ma200"]
 
-            rsi   = df.iloc[-1]["rsi"]
-            ma50  = df.iloc[-1]["ma50"]
-            ma200 = df.iloc[-1]["ma200"]
+                log.info(
+                    f"[{symbol}] Prix : {price:.2f} | RSI : {rsi:.1f} | "
+                    f"MA50 : {ma50:.2f} | MA200 : {ma200:.2f} | "
+                    f"Capital : {state['capital']:.2f} USDC | "
+                    f"PnL : {state['pnl_total']:+.2f} USDC"
+                )
 
-            log.info(
-                f"Prix : {price:.2f} | RSI : {rsi:.1f} | "
-                f"MA50 : {ma50:.2f} | MA200 : {ma200:.2f} | "
-                f"USDC : {usdc:.2f} | BTC : {btc:.6f} | "
-                f"Total : {total:.2f} USDC | PnL : {state['pnl_total']:+.2f} USDC"
-            )
+                check_exit(exchange, symbol, price, state, cfg)
 
-            if check_drawdown(exchange, price):
-                break
+                sig = signal(df, cfg)
+                log.info(f"[{symbol}] Signal : {sig}")
 
-            check_exit(exchange, price)
+                if sig == "BUY" and state["position"] is None:
+                    buy(exchange, symbol, price, state, cfg)
+                elif sig == "SELL" and state["position"] == "long":
+                    sell(exchange, symbol, price, state, reason="signal")
 
-            sig = signal(df)
-            log.info(f"Signal : {sig}")
+            except Exception as e:
+                log.error(f"[{symbol}] Erreur : {e}", exc_info=True)
 
-            if sig == "BUY" and state["position"] is None:
-                buy(exchange, price)
-            elif sig == "SELL" and state["position"] == "long":
-                sell(exchange, price, reason="signal")
-
-        except Exception as e:
-            log.error(f"Erreur : {e}", exc_info=True)
+            time.sleep(2)  # petite pause entre les deux paires
 
         time.sleep(LOOP_INTERVAL)
 
