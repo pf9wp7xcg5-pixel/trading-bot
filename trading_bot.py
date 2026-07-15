@@ -32,13 +32,17 @@ LOOP_INTERVAL = 60 * 60  # toutes les heures
 # à chaque déploiement, exactement comme le run du 15 juillet.
 STATE_FILE = os.environ.get("STATE_FILE_PATH", "bot_state.json")
 
+# Portefeuille simulé utilisé pour calculer l'allocation 70/30 en mode PAPER_TRADING
+# (pas de vrai solde Kraken à interroger dans ce cas).
+PAPER_TRADING_SIMULATED_TOTAL = float(os.environ.get("PAPER_TRADING_SIMULATED_TOTAL", "322.0"))
+
 # ─────────────────────────────────────────────
 #  CONFIGURATION PAR PAIRE
 # ─────────────────────────────────────────────
 
 PAIRS_CONFIG = {
     "BTC/USDC": {
-        "capital":        226.0,   # 70% de 322 USDC
+        "allocation_pct": 0.70,   # 70% du portefeuille total (cash + positions)
         "risk_per_trade": 0.02,
         "stop_loss_pct":  0.03,
         "take_profit_pct":0.06,
@@ -48,7 +52,7 @@ PAIRS_CONFIG = {
         "timeframe":      "1h",
     },
     "ETH/USDC": {
-        "capital":        96.0,    # 30% de 322 USDC
+        "allocation_pct": 0.30,   # 30% du portefeuille total (cash + positions)
         "risk_per_trade": 0.02,
         "stop_loss_pct":  0.04,    # ETH plus volatile → stop plus large
         "take_profit_pct":0.08,    # ETH plus volatile → TP plus ambitieux
@@ -89,29 +93,38 @@ def init_state(config: dict) -> dict:
         "suspended":       False,  # True si le drawdown max a été atteint
     }
 
-def load_states(configs: dict) -> dict:
-    """Recharge l'état sauvegardé si présent, sinon initialise à neuf."""
+def load_states(configs: dict):
+    """
+    Recharge l'état sauvegardé si présent. Renvoie (states, fresh_symbols) où
+    fresh_symbols est la liste des paires sans état persistant — celles-ci
+    n'ont pas encore de "capital" défini et doivent passer par l'allocation
+    dynamique (voir total_portfolio_value / répartition 70/30) avant init_state.
+    """
+    saved = {}
     if os.path.exists(STATE_FILE):
         try:
             with open(STATE_FILE, "r") as f:
                 saved = json.load(f)
-            states = {}
-            for sym, cfg in configs.items():
-                if sym in saved:
-                    states[sym] = saved[sym]
-                    log.info(f"[{sym}] État restauré depuis {STATE_FILE} (position : {states[sym]['position']})")
-                else:
-                    states[sym] = init_state(cfg)
-            return states
         except Exception as e:
             log.error(f"Impossible de lire {STATE_FILE} ({e}) — initialisation à neuf.")
+            saved = {}
     else:
         log.warning(
             f"Aucun fichier d'état trouvé ({STATE_FILE}) — initialisation à neuf. "
             f"Si le bot a déjà tradé avant aujourd'hui, vérifie que le Volume Railway "
             f"est bien monté, sinon l'historique de position est perdu."
         )
-    return {sym: init_state(cfg) for sym, cfg in configs.items()}
+
+    states = {}
+    fresh_symbols = []
+    for sym in configs:
+        if sym in saved:
+            states[sym] = saved[sym]
+            log.info(f"[{sym}] État restauré depuis {STATE_FILE} (position : {states[sym]['position']})")
+        else:
+            states[sym] = None  # sera initialisé après allocation dynamique du capital
+            fresh_symbols.append(sym)
+    return states, fresh_symbols
 
 def save_states(states: dict) -> None:
     try:
@@ -180,6 +193,48 @@ def get_price(exchange, symbol: str) -> float:
 # En dessous de ces quantités, on considère que c'est de la poussière
 # (reliquat d'arrondi/frais) et pas une vraie position.
 DUST_THRESHOLD = {"BTC": 0.0001, "ETH": 0.001}
+
+# ─────────────────────────────────────────────
+#  ALLOCATION DYNAMIQUE DU CAPITAL
+# ─────────────────────────────────────────────
+
+def total_portfolio_value(exchange, symbols) -> float:
+    """Valeur totale réelle du portefeuille (cash USDC + toutes les positions détenues)."""
+    balance = exchange.fetch_balance()
+    total = float(balance.get("USDC", {}).get("total", 0.0))
+    for symbol in symbols:
+        base = symbol.split("/")[0]
+        qty = float(balance.get(base, {}).get("total", 0.0))
+        if qty > DUST_THRESHOLD.get(base, 0.0):
+            total += qty * get_price(exchange, symbol)
+    return total
+
+def allocate_capital(exchange, configs: dict, fresh_symbols: list) -> None:
+    """
+    Détermine dynamiquement le 'capital' (au sens PAIRS_CONFIG) des paires qui n'ont
+    pas encore d'état persistant, en répartissant la valeur totale actuelle du
+    portefeuille selon 'allocation_pct'. Une fois l'état sauvegardé, ce calcul n'est
+    plus refait pour cette paire — seul le premier lancement (ou l'ajout d'une
+    nouvelle paire) déclenche une nouvelle allocation.
+    """
+    if not fresh_symbols:
+        return
+
+    if PAPER_TRADING:
+        total_value = PAPER_TRADING_SIMULATED_TOTAL
+        log.info(f"[PAPER] Portefeuille simulé utilisé pour l'allocation : {total_value:.2f} USDC")
+    else:
+        total_value = total_portfolio_value(exchange, configs.keys())
+        log.info(f"Valeur totale réelle du portefeuille (cash + positions) : {total_value:.2f} USDC")
+
+    for sym in fresh_symbols:
+        cfg = configs[sym]
+        cfg["capital"] = round(total_value * cfg["allocation_pct"], 2)
+        log.info(
+            f"[{sym}] Capital initial alloué dynamiquement : {cfg['capital']:.2f} USDC "
+            f"({cfg['allocation_pct']*100:.0f}% de {total_value:.2f} USDC)"
+        )
+
 
 def reconcile_startup_position(exchange, symbol: str, state: dict, cfg: dict) -> None:
     """
@@ -387,19 +442,26 @@ def run() -> None:
     mode = "PAPER TRADING" if PAPER_TRADING else "TRADING RÉEL ⚠️"
     log.info(f"═══ Démarrage du bot multi-paires [{mode}] ═══")
     for sym, cfg in PAIRS_CONFIG.items():
-        log.info(f"  {sym} → capital : {cfg['capital']:.2f} USDC | SL : {cfg['stop_loss_pct']*100:.0f}% | TP : {cfg['take_profit_pct']*100:.0f}%")
+        log.info(f"  {sym} → allocation : {cfg['allocation_pct']*100:.0f}% | SL : {cfg['stop_loss_pct']*100:.0f}% | TP : {cfg['take_profit_pct']*100:.0f}%")
 
     exchange = connect()
 
-    # Recharger l'état sauvegardé (positions, capital, PnL) s'il existe,
-    # sinon repartir des valeurs par défaut de PAIRS_CONFIG.
-    states = load_states(PAIRS_CONFIG)
+    # Recharger l'état sauvegardé (positions, capital, PnL) s'il existe.
+    # 'fresh' = paires sans état persistant, qui n'ont pas encore de capital défini.
+    states, fresh = load_states(PAIRS_CONFIG)
+
+    # Allocation dynamique 70/30 (ou selon 'allocation_pct') uniquement pour les
+    # paires fraîches — une paire déjà tradée garde le capital fixé lors de son
+    # tout premier lancement, mis à jour ensuite par les achats/ventes réels.
+    allocate_capital(exchange, PAIRS_CONFIG, fresh)
+    for sym in fresh:
+        states[sym] = init_state(PAIRS_CONFIG[sym])
 
     if not PAPER_TRADING:
         for sym, cfg in PAIRS_CONFIG.items():
             reconcile_startup_position(exchange, sym, states[sym], cfg)
         check_startup_balance(exchange, states)
-        save_states(states)  # persiste immédiatement le résultat de la réconciliation
+        save_states(states)  # persiste immédiatement le résultat de l'allocation/réconciliation
 
     while True:
         for symbol, cfg in PAIRS_CONFIG.items():
