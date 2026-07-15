@@ -78,6 +78,7 @@ def init_state(config: dict) -> dict:
         "capital_initial": config["capital"],
         "pnl_total":       0.0,
         "trade_count":     0,
+        "suspended":       False,  # True si le drawdown max a été atteint
     }
 
 # ─────────────────────────────────────────────
@@ -148,11 +149,33 @@ def position_size(capital: float, price: float, cfg: dict) -> float:
     stop_d  = price * cfg["stop_loss_pct"]
     return round(risk / stop_d, 6)
 
-def check_drawdown(state: dict, cfg: dict) -> bool:
-    loss = (state["capital_initial"] - state["capital"]) / state["capital_initial"]
+def equity(state: dict, price: float) -> float:
+    """Valeur totale = cash disponible + valeur de la position ouverte au prix actuel."""
+    position_value = state["quantity"] * price if state["position"] == "long" else 0.0
+    return state["capital"] + position_value
+
+def check_drawdown(symbol: str, state: dict, cfg: dict, price: float) -> bool:
+    """
+    Calcule le drawdown sur l'équité totale (cash + position ouverte), pas seulement
+    le cash restant — sinon un simple achat est compté comme une perte.
+    """
+    eq   = equity(state, price)
+    loss = (state["capital_initial"] - eq) / state["capital_initial"]
+
     if loss >= cfg["max_drawdown"]:
-        log.warning(f"Drawdown max atteint ({loss:.1%}). Paire suspendue.")
+        if not state["suspended"]:
+            # On ne log l'alerte qu'une seule fois, au moment où elle se déclenche,
+            # pour ne pas spammer les logs à chaque boucle (toutes les heures).
+            log.warning(
+                f"[{symbol}] Drawdown max atteint ({loss:.1%}, équité : {eq:.2f} USDC). "
+                f"Paire suspendue."
+            )
+            state["suspended"] = True
         return True
+
+    if state["suspended"]:
+        log.info(f"[{symbol}] Équité remontée au-dessus du seuil ({loss:.1%}). Paire réactivée.")
+    state["suspended"] = False
     return False
 
 # ─────────────────────────────────────────────
@@ -248,12 +271,23 @@ def run() -> None:
         for symbol, cfg in PAIRS_CONFIG.items():
             state = states[symbol]
             try:
-                if check_drawdown(state, cfg):
+                price = get_price(exchange, symbol)
+
+                # Le stop-loss / take-profit doit TOUJOURS pouvoir s'exécuter,
+                # même si la paire est "suspendue" — sinon une position ouverte
+                # reste sans protection en cas de retournement du marché.
+                check_exit(exchange, symbol, price, state, cfg)
+
+                suspended = check_drawdown(symbol, state, cfg, price)
+                if suspended:
+                    log.info(
+                        f"[{symbol}] Suspendue (drawdown) — nouvelles entrées bloquées, "
+                        f"stop-loss/take-profit toujours actifs."
+                    )
                     continue
 
                 df    = get_ohlcv(exchange, symbol, cfg["timeframe"])
                 df    = compute_indicators(df)
-                price = get_price(exchange, symbol)
 
                 rsi   = df.iloc[-1]["rsi"]
                 ma50  = df.iloc[-1]["ma50"]
@@ -263,10 +297,9 @@ def run() -> None:
                     f"[{symbol}] Prix : {price:.2f} | RSI : {rsi:.1f} | "
                     f"MA50 : {ma50:.2f} | MA200 : {ma200:.2f} | "
                     f"Capital : {state['capital']:.2f} USDC | "
+                    f"Équité : {equity(state, price):.2f} USDC | "
                     f"PnL : {state['pnl_total']:+.2f} USDC"
                 )
-
-                check_exit(exchange, symbol, price, state, cfg)
 
                 sig = signal(df, cfg)
                 log.info(f"[{symbol}] Signal : {sig}")
