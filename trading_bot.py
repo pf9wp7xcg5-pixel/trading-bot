@@ -8,6 +8,7 @@ Installation :
 """
 
 import time
+import json
 import logging
 import os
 import ccxt
@@ -23,6 +24,13 @@ API_SECRET = os.environ.get("KRAKEN_API_SECRET", "")
 
 PAPER_TRADING = os.environ.get("PAPER_TRADING", "true").lower() == "true"
 LOOP_INTERVAL = 60 * 60  # toutes les heures
+
+# Fichier de persistance de l'état (positions, capital, PnL) entre redémarrages.
+# ⚠️ Sur Railway, le système de fichiers est éphémère par défaut : il faut
+# attacher un "Volume" au service et le monter sur ce chemin (ex : /data)
+# pour que l'état survive à un redéploiement. Sinon ce fichier repart de zéro
+# à chaque déploiement, exactement comme le run du 15 juillet.
+STATE_FILE = os.environ.get("STATE_FILE_PATH", "bot_state.json")
 
 # ─────────────────────────────────────────────
 #  CONFIGURATION PAR PAIRE
@@ -81,6 +89,63 @@ def init_state(config: dict) -> dict:
         "suspended":       False,  # True si le drawdown max a été atteint
     }
 
+def load_states(configs: dict) -> dict:
+    """Recharge l'état sauvegardé si présent, sinon initialise à neuf."""
+    if os.path.exists(STATE_FILE):
+        try:
+            with open(STATE_FILE, "r") as f:
+                saved = json.load(f)
+            states = {}
+            for sym, cfg in configs.items():
+                if sym in saved:
+                    states[sym] = saved[sym]
+                    log.info(f"[{sym}] État restauré depuis {STATE_FILE} (position : {states[sym]['position']})")
+                else:
+                    states[sym] = init_state(cfg)
+            return states
+        except Exception as e:
+            log.error(f"Impossible de lire {STATE_FILE} ({e}) — initialisation à neuf.")
+    else:
+        log.warning(
+            f"Aucun fichier d'état trouvé ({STATE_FILE}) — initialisation à neuf. "
+            f"Si le bot a déjà tradé avant aujourd'hui, vérifie que le Volume Railway "
+            f"est bien monté, sinon l'historique de position est perdu."
+        )
+    return {sym: init_state(cfg) for sym, cfg in configs.items()}
+
+def save_states(states: dict) -> None:
+    try:
+        with open(STATE_FILE, "w") as f:
+            json.dump(states, f, indent=2)
+    except Exception as e:
+        log.error(f"Impossible d'écrire {STATE_FILE} : {e}")
+
+def check_startup_balance(exchange, states: dict) -> None:
+    """
+    Compare le cash que le bot croit détenir (somme des 'capital' en mémoire/fichier)
+    au solde USDC réel sur Kraken. Un écart important signale un état désynchronisé
+    (ex : redéploiement sans persistance, trade manuel sur le compte, etc.).
+    """
+    try:
+        balance   = exchange.fetch_balance()
+        usdc_free = float(balance.get("USDC", {}).get("free", 0.0))
+    except Exception as e:
+        log.error(f"Vérification du solde au démarrage impossible : {e}")
+        return
+
+    expected_cash = sum(s["capital"] for s in states.values())
+    diff          = abs(usdc_free - expected_cash)
+    tolerance     = max(5.0, 0.05 * expected_cash)  # 5 USDC ou 5%, le plus grand des deux
+
+    if diff > tolerance:
+        log.warning(
+            f"⚠️ Écart détecté au démarrage : cash attendu par le bot = {expected_cash:.2f} USDC, "
+            f"solde USDC réel sur Kraken = {usdc_free:.2f} USDC (écart : {diff:.2f} USDC). "
+            f"Vérifie manuellement les positions avant de laisser le bot trader en mode réel."
+        )
+    else:
+        log.info(f"Vérification du solde OK — attendu : {expected_cash:.2f} USDC, réel : {usdc_free:.2f} USDC.")
+
 # ─────────────────────────────────────────────
 #  CONNEXION
 # ─────────────────────────────────────────────
@@ -107,6 +172,68 @@ def get_ohlcv(exchange, symbol: str, timeframe: str, limit: int = 250) -> pd.Dat
 
 def get_price(exchange, symbol: str) -> float:
     return float(exchange.fetch_ticker(symbol)["last"])
+
+# ─────────────────────────────────────────────
+#  RÉCONCILIATION AU DÉMARRAGE
+# ─────────────────────────────────────────────
+
+# En dessous de ces quantités, on considère que c'est de la poussière
+# (reliquat d'arrondi/frais) et pas une vraie position.
+DUST_THRESHOLD = {"BTC": 0.0001, "ETH": 0.001}
+
+def reconcile_startup_position(exchange, symbol: str, state: dict, cfg: dict) -> None:
+    """
+    Si le bot n'a aucune position en mémoire/fichier mais que le compte Kraken détient
+    réellement l'actif (ex : achat fait avant la mise en place de la persistance, ou état
+    perdu suite à un redéploiement), on reconstruit la position à partir de l'historique
+    de trades réel plutôt que de l'ignorer silencieusement.
+    """
+    if state["position"] is not None:
+        return  # position déjà connue via le fichier d'état, rien à faire
+
+    base_asset = symbol.split("/")[0]
+    try:
+        balance = exchange.fetch_balance()
+        qty     = float(balance.get(base_asset, {}).get("free", 0.0))
+    except Exception as e:
+        log.error(f"[{symbol}] Impossible de vérifier le solde {base_asset} pour réconciliation : {e}")
+        return
+
+    if qty <= DUST_THRESHOLD.get(base_asset, 0.0):
+        return  # rien détenu de significatif, l'état "aucune position" est correct
+
+    # Position détectée mais inconnue du bot → on cherche le prix d'entrée réel
+    entry_price = None
+    try:
+        trades = exchange.fetch_my_trades(symbol, limit=50)
+        buys   = [t for t in trades if t.get("side") == "buy"]
+        if buys:
+            total_cost = sum(t["price"] * t["amount"] for t in buys)
+            total_qty  = sum(t["amount"] for t in buys)
+            if total_qty > 0:
+                entry_price = total_cost / total_qty
+    except Exception as e:
+        log.error(f"[{symbol}] Impossible de lire l'historique de trades : {e}")
+
+    if entry_price is None:
+        entry_price = get_price(exchange, symbol)
+        log.warning(
+            f"[{symbol}] Position détectée ({qty} {base_asset}) mais aucun historique de "
+            f"trades exploitable. Prix d'entrée approximé au prix actuel ({entry_price:.2f}) "
+            f"— le stop-loss/take-profit démarre à partir de maintenant, pas du vrai prix d'achat."
+        )
+
+    invested = qty * entry_price
+    state["position"]    = "long"
+    state["quantity"]    = qty
+    state["entry_price"] = entry_price
+    state["capital"]     = max(0.0, cfg["capital"] - invested)
+
+    log.warning(
+        f"[{symbol}] Position reconstituée automatiquement : {qty} {base_asset} @ {entry_price:.2f} "
+        f"(cash restant estimé pour cette paire : {state['capital']:.2f} USDC). "
+        f"Vérifie que ça correspond bien à la réalité de ton portefeuille."
+    )
 
 # ─────────────────────────────────────────────
 #  INDICATEURS
@@ -264,8 +391,15 @@ def run() -> None:
 
     exchange = connect()
 
-    # Initialiser l'état de chaque paire
-    states = {sym: init_state(cfg) for sym, cfg in PAIRS_CONFIG.items()}
+    # Recharger l'état sauvegardé (positions, capital, PnL) s'il existe,
+    # sinon repartir des valeurs par défaut de PAIRS_CONFIG.
+    states = load_states(PAIRS_CONFIG)
+
+    if not PAPER_TRADING:
+        for sym, cfg in PAIRS_CONFIG.items():
+            reconcile_startup_position(exchange, sym, states[sym], cfg)
+        check_startup_balance(exchange, states)
+        save_states(states)  # persiste immédiatement le résultat de la réconciliation
 
     while True:
         for symbol, cfg in PAIRS_CONFIG.items():
@@ -312,6 +446,7 @@ def run() -> None:
             except Exception as e:
                 log.error(f"[{symbol}] Erreur : {e}", exc_info=True)
 
+            save_states(states)  # persiste l'état à chaque itération, même en cas d'erreur
             time.sleep(2)  # petite pause entre les deux paires
 
         time.sleep(LOOP_INTERVAL)
