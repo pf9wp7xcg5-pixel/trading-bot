@@ -50,6 +50,7 @@ PAIRS_CONFIG = {
         "rsi_buy":        40,
         "rsi_sell":       65,
         "timeframe":      "1h",
+        "cooldown_hours": 4,      # pas de rachat avant 4h après un stop-loss
     },
     "ETH/USDC": {
         "allocation_pct": 0.30,   # 30% du portefeuille total (cash + positions)
@@ -60,6 +61,7 @@ PAIRS_CONFIG = {
         "rsi_buy":        40,
         "rsi_sell":       65,
         "timeframe":      "1h",
+        "cooldown_hours": 4,      # pas de rachat avant 4h après un stop-loss
     },
 }
 
@@ -90,7 +92,8 @@ def init_state(config: dict) -> dict:
         "capital_initial": config["capital"],
         "pnl_total":       0.0,
         "trade_count":     0,
-        "suspended":       False,  # True si le drawdown max a été atteint
+        "suspended":       False,       # True si le drawdown max a été atteint
+        "cooldown_until":  None,        # timestamp Unix : pas de rachat avant cette date suite à un stop-loss
     }
 
 def load_states(configs: dict):
@@ -392,7 +395,7 @@ def buy(exchange, symbol: str, price: float, state: dict, cfg: dict) -> None:
     state["capital"]    -= cost
     state["trade_count"] += 1
 
-def sell(exchange, symbol: str, price: float, state: dict, reason: str = "signal") -> None:
+def sell(exchange, symbol: str, price: float, state: dict, reason: str = "signal", cfg: dict = None) -> None:
     if state["position"] != "long":
         return
 
@@ -416,6 +419,18 @@ def sell(exchange, symbol: str, price: float, state: dict, reason: str = "signal
     state["entry_price"] = 0.0
     state["quantity"]    = 0.0
 
+    if reason == "stop-loss" and cfg is not None:
+        hours = cfg.get("cooldown_hours", 4)
+        state["cooldown_until"] = time.time() + hours * 3600
+        log.warning(
+            f"[{symbol}] Cooldown activé après stop-loss : pas de nouvel achat avant "
+            f"{hours}h (jusqu'à {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(state['cooldown_until']))})."
+        )
+
+def in_cooldown(state: dict) -> bool:
+    cooldown_until = state.get("cooldown_until")
+    return cooldown_until is not None and time.time() < cooldown_until
+
 # ─────────────────────────────────────────────
 #  STOP-LOSS / TAKE-PROFIT
 # ─────────────────────────────────────────────
@@ -429,10 +444,10 @@ def check_exit(exchange, symbol: str, price: float, state: dict, cfg: dict) -> N
 
     if price <= sl:
         log.warning(f"[{symbol}] Stop-loss déclenché à {price:.2f} (seuil : {sl:.2f})")
-        sell(exchange, symbol, price, state, reason="stop-loss")
+        sell(exchange, symbol, price, state, reason="stop-loss", cfg=cfg)
     elif price >= tp:
         log.info(f"[{symbol}] Take-profit déclenché à {price:.2f} (seuil : {tp:.2f})")
-        sell(exchange, symbol, price, state, reason="take-profit")
+        sell(exchange, symbol, price, state, reason="take-profit", cfg=cfg)
 
 # ─────────────────────────────────────────────
 #  BOUCLE PRINCIPALE
@@ -501,9 +516,16 @@ def run() -> None:
                 log.info(f"[{symbol}] Signal : {sig}")
 
                 if sig == "BUY" and state["position"] is None:
-                    buy(exchange, symbol, price, state, cfg)
+                    if in_cooldown(state):
+                        remaining_min = (state["cooldown_until"] - time.time()) / 60
+                        log.info(
+                            f"[{symbol}] Signal BUY ignoré — cooldown actif encore "
+                            f"{remaining_min:.0f} min après le dernier stop-loss."
+                        )
+                    else:
+                        buy(exchange, symbol, price, state, cfg)
                 elif sig == "SELL" and state["position"] == "long":
-                    sell(exchange, symbol, price, state, reason="signal")
+                    sell(exchange, symbol, price, state, reason="signal", cfg=cfg)
 
             except Exception as e:
                 log.error(f"[{symbol}] Erreur : {e}", exc_info=True)
