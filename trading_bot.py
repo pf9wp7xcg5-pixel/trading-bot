@@ -314,11 +314,24 @@ def signal(df: pd.DataFrame, cfg: dict) -> str:
     bullish = last["ma50"] > last["ma200"]
     bearish = last["ma50"] < last["ma200"]
 
+    # Croisement de moyennes mobiles (signal de suivi de tendance, complémentaire au RSI).
+    # Golden cross : MA50 repasse au-dessus de MA200 → la tendance redevient haussière.
+    # Death cross  : MA50 repasse en dessous de MA200 → la tendance redevient baissière.
+    # Sans ça, le bot ne rentre/sort que sur des extrêmes RSI et peut rester à l'écart
+    # de rallyes qui montent sans jamais repasser en survente (ou de chutes qui
+    # continuent sans repasser en surachat).
+    golden_cross = prev["ma50"] <= prev["ma200"] and last["ma50"] > last["ma200"]
+    death_cross  = prev["ma50"] >= prev["ma200"] and last["ma50"] < last["ma200"]
+
     rsi_oversold     = last["rsi"] < cfg["rsi_buy"]
     rsi_overbought   = last["rsi"] > cfg["rsi_sell"]
     rsi_crosses_up   = prev["rsi"] < cfg["rsi_buy"]  and last["rsi"] >= cfg["rsi_buy"]
     rsi_crosses_down = prev["rsi"] > cfg["rsi_sell"] and last["rsi"] <= cfg["rsi_sell"]
 
+    if golden_cross:
+        return "BUY"
+    if death_cross:
+        return "SELL"
     if (rsi_oversold or rsi_crosses_up) and bullish:
         return "BUY"
     if (rsi_overbought or rsi_crosses_down) and bearish:
