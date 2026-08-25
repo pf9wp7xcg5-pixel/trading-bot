@@ -26,15 +26,15 @@ PAPER_TRADING = os.environ.get("PAPER_TRADING", "true").lower() == "true"
 LOOP_INTERVAL = 60 * 60  # toutes les heures
 
 # Fichier de persistance de l'état (positions, capital, PnL) entre redémarrages.
-# ⚠️ Sur Railway, le système de fichiers est éphémère par défaut : il faut
-# attacher un "Volume" au service et le monter sur ce chemin (ex : /data)
-# pour que l'état survive à un redéploiement. Sinon ce fichier repart de zéro
-# à chaque déploiement, exactement comme le run du 15 juillet.
 STATE_FILE = os.environ.get("STATE_FILE_PATH", "bot_state.json")
 
 # Portefeuille simulé utilisé pour calculer l'allocation 70/30 en mode PAPER_TRADING
-# (pas de vrai solde Kraken à interroger dans ce cas).
 PAPER_TRADING_SIMULATED_TOTAL = float(os.environ.get("PAPER_TRADING_SIMULATED_TOTAL", "322.0"))
+
+# Taux de frais Kraken (taker) appliqué à l'achat et à la vente, en proportion (0.008 = 0.8%).
+# Basé sur le taux réellement observé sur l'historique de trades (ledger Kraken) depuis le
+# 15/07 — ce taux dépend du palier de volume 30 jours et peut changer ; à ajuster si besoin.
+TAKER_FEE_PCT = float(os.environ.get("TAKER_FEE_PCT", "0.008"))
 
 # ─────────────────────────────────────────────
 #  CONFIGURATION PAR PAIRE
@@ -42,7 +42,7 @@ PAPER_TRADING_SIMULATED_TOTAL = float(os.environ.get("PAPER_TRADING_SIMULATED_TO
 
 PAIRS_CONFIG = {
     "BTC/USDC": {
-        "allocation_pct": 0.70,   # 70% du portefeuille total (cash + positions)
+        "allocation_pct": 0.70,
         "risk_per_trade": 0.02,
         "stop_loss_pct":  0.03,
         "take_profit_pct":0.06,
@@ -50,18 +50,18 @@ PAIRS_CONFIG = {
         "rsi_buy":        40,
         "rsi_sell":       65,
         "timeframe":      "1h",
-        "cooldown_hours": 4,      # pas de rachat avant 4h après un stop-loss
+        "cooldown_hours": 4,
     },
     "ETH/USDC": {
-        "allocation_pct": 0.30,   # 30% du portefeuille total (cash + positions)
+        "allocation_pct": 0.30,
         "risk_per_trade": 0.02,
-        "stop_loss_pct":  0.04,    # ETH plus volatile → stop plus large
-        "take_profit_pct":0.08,    # ETH plus volatile → TP plus ambitieux
+        "stop_loss_pct":  0.04,
+        "take_profit_pct":0.08,
         "max_drawdown":   0.10,
         "rsi_buy":        40,
         "rsi_sell":       65,
         "timeframe":      "1h",
-        "cooldown_hours": 4,      # pas de rachat avant 4h après un stop-loss
+        "cooldown_hours": 4,
     },
 }
 
@@ -88,21 +88,16 @@ def init_state(config: dict) -> dict:
         "position":        None,
         "entry_price":     0.0,
         "quantity":        0.0,
+        "cost_basis":      0.0,         # coût réel payé à l'achat (prix × qté + frais)
         "capital":         config["capital"],
         "capital_initial": config["capital"],
         "pnl_total":       0.0,
         "trade_count":     0,
-        "suspended":       False,       # True si le drawdown max a été atteint
-        "cooldown_until":  None,        # timestamp Unix : pas de rachat avant cette date suite à un stop-loss
+        "suspended":       False,
+        "cooldown_until":  None,
     }
 
 def load_states(configs: dict):
-    """
-    Recharge l'état sauvegardé si présent. Renvoie (states, fresh_symbols) où
-    fresh_symbols est la liste des paires sans état persistant — celles-ci
-    n'ont pas encore de "capital" défini et doivent passer par l'allocation
-    dynamique (voir total_portfolio_value / répartition 70/30) avant init_state.
-    """
     saved = {}
     if os.path.exists(STATE_FILE):
         try:
@@ -123,11 +118,31 @@ def load_states(configs: dict):
     for sym in configs:
         if sym in saved:
             states[sym] = saved[sym]
+            _migrate_state(states[sym])
             log.info(f"[{sym}] État restauré depuis {STATE_FILE} (position : {states[sym]['position']})")
         else:
-            states[sym] = None  # sera initialisé après allocation dynamique du capital
+            states[sym] = None
             fresh_symbols.append(sym)
     return states, fresh_symbols
+
+def _migrate_state(state: dict) -> None:
+    """
+    Complète un état chargé depuis un ancien format de bot_state.json qui n'aurait pas
+    encore le champ 'cost_basis' (introduit avec la prise en compte des frais Kraken).
+    Si une position est ouverte sans cost_basis connu, on l'estime à partir du prix
+    d'entrée enregistré + une estimation des frais, plutôt que de planter à la vente.
+    """
+    if "cost_basis" not in state:
+        if state.get("position") == "long" and state.get("entry_price", 0) > 0:
+            estimated = state["quantity"] * state["entry_price"] * (1 + TAKER_FEE_PCT)
+            state["cost_basis"] = estimated
+            log.warning(
+                f"Ancien format d'état détecté (sans cost_basis) pour une position ouverte. "
+                f"Estimation : {estimated:.2f} USDC (prix d'entrée × quantité × (1+frais)). "
+                f"Le PnL de la prochaine vente sera approximatif, pas exact."
+            )
+        else:
+            state["cost_basis"] = 0.0
 
 def save_states(states: dict) -> None:
     try:
@@ -137,11 +152,6 @@ def save_states(states: dict) -> None:
         log.error(f"Impossible d'écrire {STATE_FILE} : {e}")
 
 def check_startup_balance(exchange, states: dict) -> None:
-    """
-    Compare le cash que le bot croit détenir (somme des 'capital' en mémoire/fichier)
-    au solde USDC réel sur Kraken. Un écart important signale un état désynchronisé
-    (ex : redéploiement sans persistance, trade manuel sur le compte, etc.).
-    """
     try:
         balance   = exchange.fetch_balance()
         usdc_free = float(balance.get("USDC", {}).get("free", 0.0))
@@ -151,7 +161,7 @@ def check_startup_balance(exchange, states: dict) -> None:
 
     expected_cash = sum(s["capital"] for s in states.values())
     diff          = abs(usdc_free - expected_cash)
-    tolerance     = max(5.0, 0.05 * expected_cash)  # 5 USDC ou 5%, le plus grand des deux
+    tolerance     = max(5.0, 0.05 * expected_cash)
 
     if diff > tolerance:
         log.warning(
@@ -193,8 +203,6 @@ def get_price(exchange, symbol: str) -> float:
 #  RÉCONCILIATION AU DÉMARRAGE
 # ─────────────────────────────────────────────
 
-# En dessous de ces quantités, on considère que c'est de la poussière
-# (reliquat d'arrondi/frais) et pas une vraie position.
 DUST_THRESHOLD = {"BTC": 0.0001, "ETH": 0.001}
 
 # ─────────────────────────────────────────────
@@ -202,7 +210,6 @@ DUST_THRESHOLD = {"BTC": 0.0001, "ETH": 0.001}
 # ─────────────────────────────────────────────
 
 def total_portfolio_value(exchange, symbols) -> float:
-    """Valeur totale réelle du portefeuille (cash USDC + toutes les positions détenues)."""
     balance = exchange.fetch_balance()
     total = float(balance.get("USDC", {}).get("total", 0.0))
     for symbol in symbols:
@@ -213,13 +220,6 @@ def total_portfolio_value(exchange, symbols) -> float:
     return total
 
 def allocate_capital(exchange, configs: dict, fresh_symbols: list) -> None:
-    """
-    Détermine dynamiquement le 'capital' (au sens PAIRS_CONFIG) des paires qui n'ont
-    pas encore d'état persistant, en répartissant la valeur totale actuelle du
-    portefeuille selon 'allocation_pct'. Une fois l'état sauvegardé, ce calcul n'est
-    plus refait pour cette paire — seul le premier lancement (ou l'ajout d'une
-    nouvelle paire) déclenche une nouvelle allocation.
-    """
     if not fresh_symbols:
         return
 
@@ -240,14 +240,8 @@ def allocate_capital(exchange, configs: dict, fresh_symbols: list) -> None:
 
 
 def reconcile_startup_position(exchange, symbol: str, state: dict, cfg: dict) -> None:
-    """
-    Si le bot n'a aucune position en mémoire/fichier mais que le compte Kraken détient
-    réellement l'actif (ex : achat fait avant la mise en place de la persistance, ou état
-    perdu suite à un redéploiement), on reconstruit la position à partir de l'historique
-    de trades réel plutôt que de l'ignorer silencieusement.
-    """
     if state["position"] is not None:
-        return  # position déjà connue via le fichier d'état, rien à faire
+        return
 
     base_asset = symbol.split("/")[0]
     try:
@@ -258,18 +252,26 @@ def reconcile_startup_position(exchange, symbol: str, state: dict, cfg: dict) ->
         return
 
     if qty <= DUST_THRESHOLD.get(base_asset, 0.0):
-        return  # rien détenu de significatif, l'état "aucune position" est correct
+        return
 
-    # Position détectée mais inconnue du bot → on cherche le prix d'entrée réel
     entry_price = None
+    real_fees   = 0.0
     try:
         trades = exchange.fetch_my_trades(symbol, limit=50)
         buys   = [t for t in trades if t.get("side") == "buy"]
         if buys:
             total_cost = sum(t["price"] * t["amount"] for t in buys)
             total_qty  = sum(t["amount"] for t in buys)
+            # Frais réels payés à l'achat, quand l'exchange les renvoie dans le trade
+            # (utilisés pour reconstruire un cost_basis fidèle, sinon on retombe sur
+            # une estimation via TAKER_FEE_PCT juste en dessous).
+            real_fees = sum(
+                t["fee"]["cost"] for t in buys
+                if t.get("fee") and t["fee"].get("currency") in (None, "USDC")
+            )
             if total_qty > 0:
                 entry_price = total_cost / total_qty
+
     except Exception as e:
         log.error(f"[{symbol}] Impossible de lire l'historique de trades : {e}")
 
@@ -282,10 +284,16 @@ def reconcile_startup_position(exchange, symbol: str, state: dict, cfg: dict) ->
         )
 
     invested = qty * entry_price
+    # Si on n'a pas pu récupérer les frais réels (ex : entry_price approximé), on les
+    # estime avec le taux configuré pour ne pas sous-évaluer le coût réel de la position.
+    fees_component = real_fees if real_fees > 0 else invested * TAKER_FEE_PCT
+    cost_basis = invested + fees_component
+
     state["position"]    = "long"
     state["quantity"]    = qty
     state["entry_price"] = entry_price
-    state["capital"]     = max(0.0, cfg["capital"] - invested)
+    state["cost_basis"]  = cost_basis
+    state["capital"]     = max(0.0, cfg["capital"] - cost_basis)
 
     log.warning(
         f"[{symbol}] Position reconstituée automatiquement : {qty} {base_asset} @ {entry_price:.2f} "
@@ -314,12 +322,6 @@ def signal(df: pd.DataFrame, cfg: dict) -> str:
     bullish = last["ma50"] > last["ma200"]
     bearish = last["ma50"] < last["ma200"]
 
-    # Croisement de moyennes mobiles (signal de suivi de tendance, complémentaire au RSI).
-    # Golden cross : MA50 repasse au-dessus de MA200 → la tendance redevient haussière.
-    # Death cross  : MA50 repasse en dessous de MA200 → la tendance redevient baissière.
-    # Sans ça, le bot ne rentre/sort que sur des extrêmes RSI et peut rester à l'écart
-    # de rallyes qui montent sans jamais repasser en survente (ou de chutes qui
-    # continuent sans repasser en surachat).
     golden_cross = prev["ma50"] <= prev["ma200"] and last["ma50"] > last["ma200"]
     death_cross  = prev["ma50"] >= prev["ma200"] and last["ma50"] < last["ma200"]
 
@@ -348,22 +350,15 @@ def position_size(capital: float, price: float, cfg: dict) -> float:
     return round(risk / stop_d, 6)
 
 def equity(state: dict, price: float) -> float:
-    """Valeur totale = cash disponible + valeur de la position ouverte au prix actuel."""
     position_value = state["quantity"] * price if state["position"] == "long" else 0.0
     return state["capital"] + position_value
 
 def check_drawdown(symbol: str, state: dict, cfg: dict, price: float) -> bool:
-    """
-    Calcule le drawdown sur l'équité totale (cash + position ouverte), pas seulement
-    le cash restant — sinon un simple achat est compté comme une perte.
-    """
     eq   = equity(state, price)
     loss = (state["capital_initial"] - eq) / state["capital_initial"]
 
     if loss >= cfg["max_drawdown"]:
         if not state["suspended"]:
-            # On ne log l'alerte qu'une seule fois, au moment où elle se déclenche,
-            # pour ne pas spammer les logs à chaque boucle (toutes les heures).
             log.warning(
                 f"[{symbol}] Drawdown max atteint ({loss:.1%}, équité : {eq:.2f} USDC). "
                 f"Paire suspendue."
@@ -386,51 +381,61 @@ def buy(exchange, symbol: str, price: float, state: dict, cfg: dict) -> None:
         log.warning(f"[{symbol}] Capital insuffisant : {capital:.2f} USDC")
         return
 
-    qty  = position_size(capital, price, cfg)
-    cost = qty * price
-    if cost > capital:
-        qty  = round((capital * 0.95) / price, 6)
-        cost = qty * price
+    qty       = position_size(capital, price, cfg)
+    cost      = qty * price
+    fee       = cost * TAKER_FEE_PCT
+    total_cost = cost + fee
+    if total_cost > capital:
+        # On laisse une petite marge (0.95) pour rester sûr de couvrir prix + frais
+        qty        = round((capital * 0.95) / (price * (1 + TAKER_FEE_PCT)), 6)
+        cost       = qty * price
+        fee        = cost * TAKER_FEE_PCT
+        total_cost = cost + fee
 
     if PAPER_TRADING:
-        log.info(f"[PAPER][{symbol}] ACHAT {qty} @ {price:.2f} (coût : {cost:.2f} USDC)")
+        log.info(f"[PAPER][{symbol}] ACHAT {qty} @ {price:.2f} (coût : {cost:.2f} + frais {fee:.2f} = {total_cost:.2f} USDC)")
     else:
         try:
             exchange.create_market_buy_order(symbol, qty)
-            log.info(f"[RÉEL] [{symbol}] ACHAT {qty} @ ~{price:.2f} USDC")
+            log.info(f"[RÉEL] [{symbol}] ACHAT {qty} @ ~{price:.2f} USDC (frais estimés : {fee:.2f} USDC)")
         except Exception as e:
             log.error(f"[{symbol}] Erreur achat : {e}")
             return
 
     state["position"]    = "long"
-    state["entry_price"] = price
+    state["entry_price"] = price          # prix de marché pur, sert de référence pour SL/TP
     state["quantity"]    = qty
-    state["capital"]    -= cost
+    state["cost_basis"]  = total_cost     # coût réel payé (frais inclus), sert au calcul du PnL
+    state["capital"]    -= total_cost
     state["trade_count"] += 1
 
 def sell(exchange, symbol: str, price: float, state: dict, reason: str = "signal", cfg: dict = None) -> None:
     if state["position"] != "long":
         return
 
-    qty     = state["quantity"]
-    gain    = (price - state["entry_price"]) * qty
-    pnl_pct = (price - state["entry_price"]) / state["entry_price"]
+    qty           = state["quantity"]
+    proceeds      = qty * price
+    fee           = proceeds * TAKER_FEE_PCT
+    net_proceeds  = proceeds - fee
+    gain          = net_proceeds - state["cost_basis"]  # PnL net, frais d'achat ET de vente inclus
+    pnl_pct       = gain / state["cost_basis"] if state["cost_basis"] else 0.0
 
     if PAPER_TRADING:
-        log.info(f"[PAPER][{symbol}] VENTE {qty} @ {price:.2f}  PnL : {gain:+.2f} USDC ({pnl_pct:+.2%})  raison : {reason}")
+        log.info(f"[PAPER][{symbol}] VENTE {qty} @ {price:.2f}  PnL net : {gain:+.2f} USDC ({pnl_pct:+.2%})  raison : {reason}")
     else:
         try:
             exchange.create_market_sell_order(symbol, qty)
-            log.info(f"[RÉEL] [{symbol}] VENTE {qty} @ ~{price:.2f}  PnL : {gain:+.2f} USDC ({pnl_pct:+.2%})")
+            log.info(f"[RÉEL] [{symbol}] VENTE {qty} @ ~{price:.2f}  PnL net : {gain:+.2f} USDC ({pnl_pct:+.2%})  (frais estimés : {fee:.2f} USDC)")
         except Exception as e:
             log.error(f"[{symbol}] Erreur vente : {e}")
             return
 
-    state["capital"]    += qty * price
+    state["capital"]    += net_proceeds
     state["pnl_total"]  += gain
     state["position"]    = None
     state["entry_price"] = 0.0
     state["quantity"]    = 0.0
+    state["cost_basis"]  = 0.0
 
     if reason == "stop-loss" and cfg is not None:
         hours = cfg.get("cooldown_hours", 4)
@@ -474,13 +479,8 @@ def run() -> None:
 
     exchange = connect()
 
-    # Recharger l'état sauvegardé (positions, capital, PnL) s'il existe.
-    # 'fresh' = paires sans état persistant, qui n'ont pas encore de capital défini.
     states, fresh = load_states(PAIRS_CONFIG)
 
-    # Allocation dynamique 70/30 (ou selon 'allocation_pct') uniquement pour les
-    # paires fraîches — une paire déjà tradée garde le capital fixé lors de son
-    # tout premier lancement, mis à jour ensuite par les achats/ventes réels.
     allocate_capital(exchange, PAIRS_CONFIG, fresh)
     for sym in fresh:
         states[sym] = init_state(PAIRS_CONFIG[sym])
@@ -489,7 +489,7 @@ def run() -> None:
         for sym, cfg in PAIRS_CONFIG.items():
             reconcile_startup_position(exchange, sym, states[sym], cfg)
         check_startup_balance(exchange, states)
-        save_states(states)  # persiste immédiatement le résultat de l'allocation/réconciliation
+        save_states(states)
 
     while True:
         for symbol, cfg in PAIRS_CONFIG.items():
@@ -497,9 +497,6 @@ def run() -> None:
             try:
                 price = get_price(exchange, symbol)
 
-                # Le stop-loss / take-profit doit TOUJOURS pouvoir s'exécuter,
-                # même si la paire est "suspendue" — sinon une position ouverte
-                # reste sans protection en cas de retournement du marché.
                 check_exit(exchange, symbol, price, state, cfg)
 
                 suspended = check_drawdown(symbol, state, cfg, price)
@@ -543,8 +540,8 @@ def run() -> None:
             except Exception as e:
                 log.error(f"[{symbol}] Erreur : {e}", exc_info=True)
 
-            save_states(states)  # persiste l'état à chaque itération, même en cas d'erreur
-            time.sleep(2)  # petite pause entre les deux paires
+            save_states(states)
+            time.sleep(2)
 
         time.sleep(LOOP_INTERVAL)
 
